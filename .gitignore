@@ -36,3 +36,6 @@ Thumbs.db
 *.o
 *.obj
 *.d
+
+# Reliability test output
+tests/results/

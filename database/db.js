@@ -243,8 +243,8 @@ function getHabitById(habitId) {
   return db.prepare('SELECT * FROM habits WHERE id = ?').get(habitId);
 }
 
-function hasCompletedToday(playerId, habitId) {
-  const today = getLocalDateString();
+function hasCompletedToday(playerId, habitId, logDate) {
+  const today = logDate || getLocalDateString();
   const row = db.prepare(`
     SELECT id FROM habit_logs 
     WHERE player_id = ? AND habit_id = ? AND log_date = ?
@@ -252,15 +252,17 @@ function hasCompletedToday(playerId, habitId) {
   return !!row;
 }
 
-function recordHabitCompletion(playerId, habitId) {
-  const today = getLocalDateString();
+// logDate (optional, YYYY-MM-DD): the day the habit was actually done.
+// Used for events synced later from the ESP32's offline queue.
+function recordHabitCompletion(playerId, habitId, logDate) {
+  const today = logDate || getLocalDateString();
   const habit = getHabitById(habitId);
   if (!habit) {
     throw new Error(`Unknown habit: ${habitId}`);
   }
 
   // Check duplicate
-  if (hasCompletedToday(playerId, habitId)) {
+  if (hasCompletedToday(playerId, habitId, today)) {
     return {
       success: false,
       duplicate: true,

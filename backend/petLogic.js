@@ -50,7 +50,7 @@ function processRfidScan(uid) {
   };
 }
 
-function processHabitSubmission(uid, habitKey) {
+function processHabitSubmission(uid, habitKey, logDate) {
   if (!uid || typeof uid !== 'string') {
     return { success: false, error: 'Missing or invalid UID' };
   }
@@ -91,7 +91,7 @@ function processHabitSubmission(uid, habitKey) {
     };
   }
 
-  const result = db.recordHabitCompletion(player.id, cleanHabit);
+  const result = db.recordHabitCompletion(player.id, cleanHabit, logDate);
 
   if (result.duplicate) {
     return {
