@@ -1,0 +1,19 @@
+{
+  "name": "petlink",
+  "version": "1.0.0",
+  "description": "PetLink - IoT Multiplayer Virtual Pet and Habit Tracker",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev": "node backend/server.js",
+    "test": "node test-suite.js",
+    "simulate": "node test-mqtt-sim.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mqtt": "^5.10.3",
+    "socket.io": "^4.8.1"
+  }
+}

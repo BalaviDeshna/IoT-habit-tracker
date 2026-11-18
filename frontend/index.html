@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PetLink 🐾 Multiplayer Virtual Pet & Habit Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="habitat-day">
+  <div class="sky-background">
+    <div class="celestial-body" id="celestialBody">☀️</div>
+    <div class="clouds">
+      <span class="cloud c1">☁️</span>
+      <span class="cloud c2">☁️</span>
+      <span class="cloud c3">☁️</span>
+    </div>
+    <div class="stars" id="starField"></div>
+  </div>
+
+  <div class="container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-icon">🐾</span>
+        <div>
+          <h1>PetLink</h1>
+          <p class="tagline">IoT Multiplayer Virtual Pet Habitat & Daily Habit Station</p>
+        </div>
+      </div>
+
+      <!-- Habitat & Broker Status Badges -->
+      <div class="status-panel">
+        <div class="status-card habitat-card" id="habitatCard">
+          <div class="status-icon" id="habitatIcon">☀️</div>
+          <div class="status-info">
+            <span class="status-label">Shared Habitat</span>
+            <span class="status-value" id="habitatCondition">DAY</span>
+            <span class="status-sub" id="habitatLux">200.0 lux</span>
+          </div>
+        </div>
+
+        <div class="status-card" id="mqttStatusCard">
+          <div class="status-icon" id="mqttDot">🟢</div>
+          <div class="status-info">
+            <span class="status-label">Mosquitto MQTT</span>
+            <span class="status-value" id="mqttStatusText">Connected</span>
+            <span class="status-sub" id="mqttBrokerText">127.0.0.1:1883</span>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Interactive OLED Station & Live Simulator -->
+    <section class="station-preview-section">
+      <div class="station-banner">
+        <div class="station-oled-wrapper">
+          <div class="oled-bezel">
+            <div class="oled-glass" id="oledScreen">
+              <div class="oled-line line-1" id="oledL1">== PETLINK STATION ==</div>
+              <div class="oled-line line-2" id="oledL2">Habitat: DAY (200 lx)</div>
+              <div class="oled-line line-3" id="oledL3">&gt;&gt; Scan RFID Card &lt;&lt;</div>
+              <div class="oled-line line-4" id="oledL4">Ready to track!</div>
+            </div>
+          </div>
+          <div class="oled-label">ESP32 SSD1306 0.96" OLED LIVE MIRROR</div>
+        </div>
+
+        <!-- Quick Station Hardware Tester -->
+        <div class="hardware-tester">
+          <div class="tester-header">
+            <h3>🎮 Station Controls & Hardware Simulation</h3>
+            <span class="chip">Test without hardware</span>
+          </div>
+          <p class="tester-desc">Tap any player's RFID card or simulate light sensor & button actions:</p>
+
+          <div class="tester-button-grid">
+            <button class="test-btn" onclick="simulateRfid('A1B2C3D4')">💳 Tap Alex (A1B2C3D4)</button>
+            <button class="test-btn" onclick="simulateRfid('E5F6A7B8')">💳 Tap Bella (E5F6A7B8)</button>
+            <button class="test-btn" onclick="simulateRfid('C9D0E1F2')">💳 Tap Charlie (C9D0E1F2)</button>
+            <button class="test-btn" onclick="simulateRfid('3A4B5C6D')">💳 Tap Diana (3A4B5C6D)</button>
+          </div>
+
+          <div class="tester-slider-row">
+            <label for="luxSlider">Light Sensor (BH1750):</label>
+            <input type="range" id="luxSlider" min="0" max="500" value="200" oninput="updateLuxInput(this.value)">
+            <span id="luxSliderVal">200 lux</span>
+            <button class="action-btn-sm" onclick="sendSimulatedLux()">Set Lux</button>
+            <button class="action-btn-sm" onclick="toggleDayNightSim()">Toggle Day/Night</button>
+            <button class="action-btn-sm danger" onclick="resetTodayLogs()">Reset Today's Logs</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main 4 Players Grid -->
+    <section class="players-section">
+      <div class="section-title-row">
+        <h2>👥 Habitat Residents & Virtual Pets</h2>
+        <span class="badge-counter" id="activePlayersCount">4 Players Ready</span>
+      </div>
+
+      <div class="players-grid" id="playersGrid">
+        <!-- Rendered dynamically by JS -->
+      </div>
+    </section>
+
+    <!-- Recent Habit Log Activity -->
+    <section class="activity-section">
+      <div class="activity-header">
+        <h2>📜 Recent Habit Activity Feed</h2>
+        <span class="feed-live-dot">● Live Feed</span>
+      </div>
+      <div class="activity-list" id="activityList">
+        <div class="empty-state">No habit logs recorded today yet. Scan a card to begin!</div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>PetLink IoT Project • ESP32 DevKit V1 + SSD1306 + RC522 + BH1750 + Mosquitto MQTT</p>
+    </footer>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Edit UID Modal -->
+  <div class="modal-overlay" id="uidModal" style="display: none;">
+    <div class="modal-box">
+      <h3>🔑 Assign Physical RFID UID</h3>
+      <p>Replace the placeholder UID for <strong id="modalPlayerName">Alex</strong> with your actual card UID read by the RC522:</p>
+      <input type="hidden" id="modalPlayerId">
+      <div class="form-group">
+        <label for="modalUidInput">RFID Card UID (Hex string, e.g. <code>A1B2C3D4</code>):</label>
+        <input type="text" id="modalUidInput" placeholder="Enter Card UID">
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" onclick="closeUidModal()">Cancel</button>
+        <button class="btn-primary" onclick="saveUidModal()">Save UID</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
