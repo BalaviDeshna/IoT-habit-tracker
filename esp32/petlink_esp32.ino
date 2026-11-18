@@ -8,6 +8,15 @@
  *   - BH1750 Ambient Light Sensor (Shared I2C SDA 21, SCL 22)
  *   - RC522 RFID Reader (SS 5, RST 4, SCK 18, MOSI 23, MISO 19)
  *   - Push Buttons: NEXT (25), SELECT (26), CONFIRM (27)
+ *
+ * Store-and-forward (offline mode):
+ *   - Confirmed habits are saved to flash first (offline_queue.*), then sent.
+ *   - Each event has a unique eventId; it is deleted from flash only after the
+ *     backend replies on petlink/device/ack. Retries are therefore safe.
+ *   - Wi-Fi/MQTT reconnect is non-blocking, so the station keeps working
+ *     (RFID + buttons + OLED) while offline and syncs when back online.
+ *   - Online/offline status is published (retained) with an MQTT Last Will.
+ *   - Events carry a real timestamp from NTP when available.
  * =========================================================================
  */
 
@@ -20,8 +29,10 @@
 #include <Adafruit_SSD1306.h>
 #include <BH1750.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 #include "config.h"
+#include "offline_queue.h"
 
 // OLED Display Configuration
 #define SCREEN_WIDTH 128
@@ -65,6 +76,15 @@ const unsigned long DEBOUNCE_DELAY = 250; // ms
 unsigned long lastLuxSendTime = 0;
 unsigned long stateTimeout = 0;
 
+// Store-and-forward state
+String inflightEventId = "";          // event sent, waiting for backend ACK
+unsigned long inflightSentAt = 0;
+int syncedThisSession = 0;            // events delivered from the offline queue
+unsigned long messageUntil = 0;       // STATE_SHOW_MESSAGE ends at this time
+String statusTopic;                   // petlink/device/status/<MQTT_CLIENT_ID>
+char willPayload[160];                // Last Will message ("offline")
+bool timeSynced = false;
+
 // Display lines buffer
 String dispLine1 = "PETLINK STATION";
 String dispLine2 = "Starting up...";
@@ -81,6 +101,12 @@ void renderScreen(const String& l1, const String& l2, const String& l3, const St
 void handleRfidCard();
 void handleButtons();
 void readAndPublishLight();
+void maintainWiFi();
+void flushQueue();
+void handleAck(const char* json);
+void showIdle();
+void showMessage(const String& l1, const String& l2, const String& l3, const String& l4, unsigned long ms);
+bool isOnline();
 
 void setup() {
   Serial.begin(115200);
@@ -119,24 +145,47 @@ void setup() {
   rfid.PCD_DumpVersionToSerial();
   Serial.println("[PetLink] RC522 RFID Reader initialized.");
 
-  // 6. Connect to WiFi & setup MQTT
+  // 6. Offline queue in flash (store-and-forward)
+  OfflineQueue::begin(MQTT_CLIENT_ID);
+
+  // 7. Connect to WiFi & setup MQTT
+  statusTopic = String(TOPIC_STATUS_PREFIX) + MQTT_CLIENT_ID;
+  snprintf(willPayload, sizeof(willPayload),
+           "{\"deviceId\":\"%s\",\"online\":false,\"reason\":\"connection_lost\"}", MQTT_CLIENT_ID);
+
   setupWiFi();
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512);   // default 256 B is too small for event JSON
+  mqttClient.setKeepAlive(10);     // broker notices a dead station within ~15 s
 
-  renderScreen("PETLINK STATION", "Ready!", "Scan RFID Card", ">> Tap Here <<");
+  showIdle();
   Serial.println("[PetLink] Setup complete. Ready for players!");
 }
 
 void loop() {
-  // 1. Maintain WiFi & MQTT connection
-  if (WiFi.status() != WL_CONNECTED) {
-    setupWiFi();
-  }
+  // 1. Maintain WiFi & MQTT connection (non-blocking: station stays usable offline)
+  maintainWiFi();
   if (!mqttClient.connected()) {
     reconnectMQTT();
   }
   mqttClient.loop();
+
+  // 1b. Deliver events saved in flash, one at a time, oldest first
+  flushQueue();
+
+  // 1c. A submitted habit got no reply -> it is safe in flash, tell the player
+  if (currentState == STATE_CONFIRMING && inflightEventId.length() > 0 &&
+      millis() - inflightSentAt > ACK_TIMEOUT_MS) {
+    showMessage("SAVED ON DEVICE", "No reply from hub", "Will sync later", String(OfflineQueue::pending()) + " pending", 3000);
+  }
+
+  // 1d. Temporary messages return to the idle screen
+  if (currentState == STATE_SHOW_MESSAGE && millis() > messageUntil) {
+    currentState = STATE_IDLE;
+    activeUid = "";
+    showIdle();
+  }
 
   // 2. Read Light Sensor periodically
   if (millis() - lastLuxSendTime >= LUX_READ_INTERVAL_MS) {
@@ -162,14 +211,16 @@ void loop() {
 // =========================================================================
 // Wi-Fi & MQTT Management
 // =========================================================================
+// Boot-time connect: waits up to ~8 s, then continues in offline mode.
 void setupWiFi() {
   Serial.printf("\n[WiFi] Connecting to %s", WIFI_SSID);
   renderScreen("WIFI CONNECTING", WIFI_SSID, "Please wait...", "");
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 25) {
+  while (WiFi.status() != WL_CONNECTED && retries < 16) {
     delay(500);
     Serial.print(".");
     retries++;
@@ -179,25 +230,123 @@ void setupWiFi() {
     Serial.printf("\n[WiFi] Connected! IP address: %s\n", WiFi.localIP().toString().c_str());
     renderScreen("WIFI CONNECTED!", WiFi.localIP().toString(), "Connecting MQTT", "");
   } else {
-    Serial.println("\n[WiFi] Connection failed. Will retry in loop.");
-    renderScreen("WIFI FAILED!", "Check Hotspot", "Retrying...", "");
+    Serial.println("\n[WiFi] Connection failed. Starting in OFFLINE mode, will keep retrying.");
+    renderScreen("WIFI FAILED!", "Offline mode on", "Habits are saved", "Retrying...");
+    delay(1500);
   }
+}
+
+// Called every loop. Never blocks: just notices changes and re-tries every WIFI_RETRY_MS.
+void maintainWiFi() {
+  static bool wasConnected = false;
+  static unsigned long lastAttempt = 0;
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected && !wasConnected) {
+    Serial.printf("[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);   // start NTP time sync in background
+  }
+  if (!connected && wasConnected) {
+    Serial.println("[WiFi] Lost connection -> OFFLINE mode (habits saved to flash).");
+    if (currentState == STATE_IDLE) showIdle();
+  }
+  wasConnected = connected;
+
+  if (!connected && millis() - lastAttempt > WIFI_RETRY_MS) {
+    lastAttempt = millis();
+    Serial.println("[WiFi] Retrying...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  // Note when NTP time becomes valid (any time after 2023 means synced)
+  if (!timeSynced && time(nullptr) > 1700000000) {
+    timeSynced = true;
+    Serial.println("[Time] NTP time synced.");
+  }
+}
+
+bool isOnline() {
+  return WiFi.status() == WL_CONNECTED && mqttClient.connected();
 }
 
 void reconnectMQTT() {
   static unsigned long lastMqttAttempt = 0;
-  if (millis() - lastMqttAttempt < 3000) return;
+  if (millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
   lastMqttAttempt = millis();
 
   if (WiFi.status() != WL_CONNECTED) return;
 
   Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER, MQTT_PORT);
-  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+  // Last Will: if this station disappears (power cut, Wi-Fi gone) the BROKER
+  // publishes willPayload for us, retained, so everyone learns we're offline.
+  if (mqttClient.connect(MQTT_CLIENT_ID, statusTopic.c_str(), 1, true, willPayload)) {
     Serial.println("[MQTT] Connected successfully!");
     mqttClient.subscribe(TOPIC_DISPLAY);
-    Serial.printf("[MQTT] Subscribed to: %s\n", TOPIC_DISPLAY);
+    mqttClient.subscribe(TOPIC_ACK);
+    Serial.printf("[MQTT] Subscribed to: %s, %s\n", TOPIC_DISPLAY, TOPIC_ACK);
+
+    // Retained "online" status (replaces the Last Will message on the broker)
+    JsonDocument doc;
+    doc["deviceId"] = MQTT_CLIENT_ID;
+    doc["online"] = true;
+    doc["ip"] = WiFi.localIP().toString();
+    doc["pending"] = OfflineQueue::pending();
+    char out[200];
+    serializeJson(doc, out);
+    mqttClient.publish(statusTopic.c_str(), out, true);
+
+    inflightEventId = "";              // re-send anything unacknowledged
+    if (currentState == STATE_IDLE) showIdle();
+    if (OfflineQueue::pending() > 0) {
+      Serial.printf("[Sync] Back online with %d saved event(s). Syncing...\n", OfflineQueue::pending());
+    }
   } else {
-    Serial.printf("[MQTT] Connect failed, rc=%d. Retrying in 3s...\n", mqttClient.state());
+    Serial.printf("[MQTT] Connect failed, rc=%d. Retrying in %ds...\n", mqttClient.state(), MQTT_RETRY_MS / 1000);
+  }
+}
+
+// Send the oldest saved event if nothing is waiting for an ACK.
+void flushQueue() {
+  if (!isOnline() || OfflineQueue::pending() == 0) return;
+  if (inflightEventId.length() > 0 && millis() - inflightSentAt < ACK_TIMEOUT_MS) return;
+
+  String eventId, json;
+  if (!OfflineQueue::peekOldest(eventId, json)) return;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) {                 // corrupted file -> drop it
+    Serial.printf("[Sync] Dropping corrupted event %s\n", eventId.c_str());
+    OfflineQueue::remove(eventId);
+    return;
+  }
+  doc["replayed"] = true;                           // tells backend: from the queue
+  char out[384];
+  serializeJson(doc, out);
+
+  if (mqttClient.publish(TOPIC_HABIT, out)) {
+    inflightEventId = eventId;
+    inflightSentAt = millis();
+    Serial.printf("[Sync] Sent %s (%d pending)\n", eventId.c_str(), OfflineQueue::pending());
+  }
+}
+
+// Backend says "stored event X" -> delete it from flash.
+void handleAck(const char* json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return;
+  const char* dev = doc["deviceId"] | "";
+  const char* eventId = doc["eventId"] | "";
+  if (strcmp(dev, MQTT_CLIENT_ID) != 0 || strlen(eventId) == 0) return;
+
+  bool wasReplay = (inflightEventId == eventId) && currentState != STATE_CONFIRMING;
+  if (OfflineQueue::remove(String(eventId)) && wasReplay) syncedThisSession++;
+  if (inflightEventId == eventId) inflightEventId = "";
+
+  // Whole backlog delivered -> say so on the OLED (only if nobody is using it)
+  if (OfflineQueue::pending() == 0 && syncedThisSession > 0 && currentState == STATE_IDLE) {
+    showMessage("SYNC COMPLETE", String(syncedThisSession) + " saved habit(s)", "sent to the hub", "", 3000);
+    syncedThisSession = 0;
   }
 }
 
@@ -211,6 +360,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   jsonBuffer[length] = '\0';
 
   Serial.printf("[MQTT RX] [%s] %s\n", topic, jsonBuffer);
+
+  // ACKs for store-and-forward events
+  if (strcmp(topic, TOPIC_ACK) == 0) {
+    handleAck(jsonBuffer);
+    return;
+  }
 
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, jsonBuffer);
@@ -230,8 +385,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     stateTimeout = millis() + 30000; // 30 sec timeout
     selectedHabitIndex = 0;
     renderHabitSelection();
+  } else if (strcmp(status, "idle") == 0 && currentState == STATE_HABIT_SELECT) {
+    // don't wipe out a player who is still choosing a habit
+    return;
   } else {
     renderScreen(line1, line2, line3, line4);
+    // Result of a submitted habit -> show it for 5 s, then back to idle
+    if (currentState == STATE_CONFIRMING) {
+      currentState = STATE_SHOW_MESSAGE;
+      messageUntil = millis() + 5000;
+    } else if (strcmp(status, "idle") == 0) {
+      currentState = STATE_IDLE;
+    }
   }
 }
 
@@ -265,11 +430,20 @@ void handleRfidCard() {
 
   char outBuffer[256];
   serializeJson(doc, outBuffer);
-  mqttClient.publish(TOPIC_RFID, outBuffer);
-  Serial.printf("[MQTT TX] [%s] %s\n", TOPIC_RFID, outBuffer);
 
-  // Show immediate feedback on OLED
-  renderScreen("CARD SCANNED!", "UID: " + uidStr, "Loading profile...", "Please wait...");
+  if (isOnline()) {
+    mqttClient.publish(TOPIC_RFID, outBuffer);
+    Serial.printf("[MQTT TX] [%s] %s\n", TOPIC_RFID, outBuffer);
+    // Show immediate feedback on OLED
+    renderScreen("CARD SCANNED!", "UID: " + uidStr, "Loading profile...", "Please wait...");
+  } else {
+    // Offline: the hub can't look the card up, so let the player pick a habit
+    // locally. The habit is saved in flash and checked by the hub on sync.
+    Serial.println("[RFID] Offline -> local habit selection.");
+    renderScreen("OFFLINE MODE", "Card: " + uidStr, "Habit will be saved", "and synced later");
+    delay(1200);
+    renderHabitSelection();
+  }
 
   // Halt PICC to avoid re-triggering immediately
   rfid.PICC_HaltA();
@@ -317,21 +491,46 @@ void handleButtons() {
       const char* chosenHabit = HABIT_KEYS[selectedHabitIndex];
       Serial.printf("[PetLink] Confirming habit: %s for UID: %s\n", chosenHabit, activeUid.c_str());
 
-      renderScreen("SUBMITTING...", HABIT_NAMES[selectedHabitIndex], "Checking daily log", "Please wait...");
+      // Build the habit event with a unique id and a real timestamp
+      String eventId = OfflineQueue::nextEventId();
+      time_t nowEpoch = time(nullptr);
+      bool haveTime = nowEpoch > 1700000000;
 
-      // Publish habit event to MQTT
-      StaticJsonDocument<256> doc;
+      JsonDocument doc;
+      doc["eventId"] = eventId;
       doc["uid"] = activeUid;
       doc["habit"] = chosenHabit;
       doc["deviceId"] = MQTT_CLIENT_ID;
+      doc["ts"] = haveTime ? (long long)nowEpoch : 0;   // unix seconds (UTC)
+      doc["tsSource"] = haveTime ? "ntp" : "none";
       doc["timestamp"] = millis();
+      doc["replayed"] = false;
 
-      char outBuffer[256];
+      char outBuffer[384];
       serializeJson(doc, outBuffer);
-      mqttClient.publish(TOPIC_HABIT, outBuffer);
-      Serial.printf("[MQTT TX] [%s] %s\n", TOPIC_HABIT, outBuffer);
 
-      currentState = STATE_CONFIRMING;
+      // 1) Write-ahead: save to flash FIRST, so a failed send can't lose it
+      bool saved = OfflineQueue::push(eventId, String(outBuffer));
+      if (!saved) {
+        Serial.println("[Queue] Could not save event! Sending without backup.");
+      }
+
+      // 2) Try to send now; it stays in flash until the backend ACKs it
+      if (isOnline() && mqttClient.publish(TOPIC_HABIT, outBuffer)) {
+        Serial.printf("[MQTT TX] [%s] %s\n", TOPIC_HABIT, outBuffer);
+        if (saved) {
+          inflightEventId = eventId;
+          inflightSentAt = millis();
+        }
+        renderScreen("SUBMITTING...", HABIT_NAMES[selectedHabitIndex], "Checking daily log", "Please wait...");
+        currentState = STATE_CONFIRMING;
+      } else if (saved) {
+        Serial.printf("[Queue] Offline: %s stored for later sync.\n", eventId.c_str());
+        showMessage("SAVED OFFLINE", HABIT_NAMES[selectedHabitIndex],
+                    String(OfflineQueue::pending()) + " waiting to sync", "Syncs when online", 3000);
+      } else {
+        showMessage("NOT SAVED!", "Device storage full", "Connect to hub", "and try again", 3000);
+      }
     } else {
       renderScreen("NO CARD ACTIVE!", "Scan RFID Card", "first to select", "a habit.");
       delay(1500);
@@ -359,7 +558,9 @@ void readAndPublishLight() {
 
   char outBuffer[256];
   serializeJson(doc, outBuffer);
-  mqttClient.publish(TOPIC_LIGHT, outBuffer);
+  if (isOnline()) {
+    mqttClient.publish(TOPIC_LIGHT, outBuffer);   // only the latest reading matters, so no queueing
+  }
 }
 
 // =========================================================================
@@ -371,6 +572,23 @@ void renderScreen(const String& l1, const String& l2, const String& l3, const St
   dispLine3 = l3;
   dispLine4 = l4;
   updateOled();
+}
+
+// Idle screen; line 4 shows the offline / sync state.
+void showIdle() {
+  int n = OfflineQueue::pending();
+  String status;
+  if (!isOnline()) status = n > 0 ? "OFFLINE: " + String(n) + " saved" : "OFFLINE mode";
+  else if (n > 0)  status = "Syncing " + String(n) + "...";
+  else             status = ">> Tap Here <<";
+  renderScreen("PETLINK STATION", "Ready", "Scan RFID Card", status);
+}
+
+// Show a message for `ms` milliseconds, then the loop returns to idle.
+void showMessage(const String& l1, const String& l2, const String& l3, const String& l4, unsigned long ms) {
+  renderScreen(l1, l2, l3, l4);
+  currentState = STATE_SHOW_MESSAGE;
+  messageUntil = millis() + ms;
 }
 
 void renderHabitSelection() {

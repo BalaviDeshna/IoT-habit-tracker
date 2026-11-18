@@ -22,6 +22,21 @@ const char* TOPIC_RFID    = "petlink/device/rfid";
 const char* TOPIC_HABIT   = "petlink/device/habit";
 const char* TOPIC_DISPLAY = "petlink/device/display";
 
+// Store-and-forward / device reliability topics
+// Status:  petlink/device/status/<MQTT_CLIENT_ID>  (retained, + Last Will "offline")
+// Ack:     backend -> ESP32 "I stored event X, you can delete it from flash"
+const char* TOPIC_STATUS_PREFIX = "petlink/device/status/";
+const char* TOPIC_ACK     = "petlink/device/ack";
+
+// Time (NTP) so events logged offline keep their real time. IST = UTC+5:30
+#define NTP_SERVER        "pool.ntp.org"
+#define TZ_OFFSET_SEC     19800
+
+// Reliability timings
+#define ACK_TIMEOUT_MS    5000   // re-send an event if no ACK within 5 s
+#define WIFI_RETRY_MS     10000  // try to re-join Wi-Fi every 10 s (non-blocking)
+#define MQTT_RETRY_MS     5000   // try to reconnect to the broker every 5 s
+
 // 4. Pin Definitions (Matches user hardware exactly)
 // I2C (SSD1306 OLED & BH1750 Light Sensor)
 #define I2C_SDA_PIN    21

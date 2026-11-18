@@ -2,8 +2,19 @@ const express = require('express');
 const router = express.Router();
 const db = require('../../database/db');
 const petLogic = require('../petLogic');
+const reliability = require('../deviceReliability');
 
 module.exports = function(mqttService, io) {
+  // Station online/offline + store-and-forward counters
+  router.get('/devices', (req, res) => {
+    try {
+      res.json({ success: true, data: { devices: reliability.listDevices(), events: reliability.getEventStats() } });
+    } catch (err) {
+      console.error('[API] /devices error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // 1. Get full initial state for dashboard load
   router.get('/state', (req, res) => {
     try {

@@ -1,6 +1,7 @@
 const mqtt = require('mqtt');
 const petLogic = require('./petLogic');
 const db = require('../database/db');
+const reliability = require('./deviceReliability');
 
 class MqttService {
   constructor(io, options = {}) {
@@ -15,7 +16,9 @@ class MqttService {
       LIGHT: 'petlink/habitat/light',
       RFID: 'petlink/device/rfid',
       HABIT: 'petlink/device/habit',
-      DISPLAY: 'petlink/device/display'
+      DISPLAY: 'petlink/device/display',
+      STATUS: reliability.STATUS_TOPIC_FILTER,   // petlink/device/status/+
+      ACK: reliability.ACK_TOPIC                 // petlink/device/ack
     };
   }
 
@@ -34,8 +37,8 @@ class MqttService {
       console.log(`[MQTT] Successfully connected to broker: ${this.brokerUrl}`);
 
       // Subscribe to all incoming device topics
-      const subscribeTopics = [this.TOPICS.LIGHT, this.TOPICS.RFID, this.TOPICS.HABIT];
-      this.client.subscribe(subscribeTopics, (err, granted) => {
+      const subscribeTopics = [this.TOPICS.LIGHT, this.TOPICS.RFID, this.TOPICS.HABIT, this.TOPICS.STATUS];
+      this.client.subscribe(subscribeTopics, { qos: 1 }, (err, granted) => {
         if (err) {
           console.error('[MQTT] Subscription error:', err.message);
         } else {
@@ -91,6 +94,17 @@ class MqttService {
       payload = JSON.parse(rawString);
     } catch (e) {
       console.warn(`[MQTT] Received invalid JSON on [${topic}]: "${rawString}"`);
+      return;
+    }
+
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      console.warn(`[MQTT] Ignoring non-object payload on [${topic}]`);
+      return;
+    }
+
+    // Device online/offline (retained status + Last Will)
+    if (topic.startsWith(reliability.STATUS_TOPIC_PREFIX)) {
+      this.handleStatusMessage(topic, payload);
       return;
     }
 
@@ -178,6 +192,30 @@ class MqttService {
     this.scheduleIdleReset(25000);
   }
 
+  handleStatusMessage(topic, payload) {
+    const status = reliability.updateStatus(topic, payload);
+    if (!status) {
+      console.warn(`[DEVICE] Invalid status message on [${topic}]:`, payload);
+      return;
+    }
+    if (status.online) {
+      const pending = status.pending ? `, ${status.pending} event(s) to sync` : '';
+      console.log(`[DEVICE] ${status.deviceId} is ONLINE (${status.ip || 'no ip'}${pending})`);
+    } else {
+      console.warn(`[DEVICE] ${status.deviceId} is OFFLINE (${status.reason})`);
+    }
+    if (this.io) this.io.emit('device_status', status);
+  }
+
+  // Tell the ESP32 its event is safely processed, so it can delete it from flash.
+  sendAck(deviceId, eventId, outcome) {
+    if (!this.client || !this.connected) return;
+    const payload = JSON.stringify({ deviceId, eventId, outcome, timestamp: Date.now() });
+    this.client.publish(this.TOPICS.ACK, payload, { qos: 1 }, (err) => {
+      if (err) console.error('[MQTT] Failed to publish ACK:', err.message);
+    });
+  }
+
   handleHabitMessage(payload, deviceId, timestamp) {
     const { uid, habit } = payload;
     if (!uid || !habit) {
@@ -185,12 +223,51 @@ class MqttService {
       return;
     }
 
-    console.log(`[MQTT] [HABIT] Submission -> Player UID: "${uid}", Habit: "${habit}" (Device: ${deviceId})`);
+    // ---- Store-and-forward: dedup by eventId (events from older firmware have none) ----
+    const eventId = payload.eventId;
+    if (eventId !== undefined && !reliability.isValidEventId(eventId)) {
+      console.warn('[MQTT] [HABIT] Invalid eventId, ignoring message:', eventId);
+      return;
+    }
+    if (eventId) {
+      const previous = reliability.findEvent(eventId);
+      if (previous) {
+        console.log(`[MQTT] [HABIT] Duplicate event ${eventId} ignored (already ${previous.result}). Re-sending ACK.`);
+        this.sendAck(deviceId, eventId, 'duplicate');
+        return;
+      }
+    }
+    const replayed = payload.replayed === true;
+    const { logDate, usedEventTime } = reliability.resolveLogDate(payload.ts);
 
-    const result = petLogic.processHabitSubmission(uid, habit);
+    console.log(`[MQTT] [HABIT] Submission -> Player UID: "${uid}", Habit: "${habit}" (Device: ${deviceId}` +
+      `${eventId ? `, event ${eventId}` : ''}${replayed ? ', synced from offline queue' : ''}` +
+      `${usedEventTime ? `, done on ${logDate}` : ''})`);
 
-    // Send feedback to ESP32 OLED
-    this.sendDisplay(result.display);
+    let result;
+    try {
+      result = petLogic.processHabitSubmission(uid, habit, logDate);
+    } catch (err) {
+      console.error('[MQTT] [HABIT] Processing failed:', err.message);
+      result = { success: false, error: err.message, display: { status: 'error', line1: 'HUB ERROR', line2: 'Habit not logged', line3: '', line4: '' } };
+    }
+
+    // Remember + ACK, so the ESP32 deletes it from flash and never resends it.
+    // Rejected events are ACKed too: retrying them would never succeed.
+    if (eventId) {
+      const outcome = result.success ? 'logged' : result.duplicate ? 'already_done' : 'rejected';
+      reliability.recordEvent({
+        eventId, deviceId, kind: 'habit', ts: Number(payload.ts) || null,
+        tsSource: payload.tsSource, replayed, result: outcome
+      });
+      this.sendAck(deviceId, eventId, outcome);
+    }
+
+    // Send feedback to ESP32 OLED (not for queued events: nobody is waiting at the
+    // station for those, the ESP32 shows its own "SYNC COMPLETE" message instead)
+    if (!replayed) {
+      this.sendDisplay(result.display);
+    }
 
     // Broadcast to frontend
     if (this.io) {
@@ -205,6 +282,9 @@ class MqttService {
           allPlayers: db.getAllPlayersWithPets(),
           recentLogs: db.getRecentLogs(10),
           deviceId,
+          eventId: eventId || null,
+          replayed,
+          logDate,
           timestamp: new Date().toISOString()
         });
       } else if (result.duplicate) {
@@ -227,7 +307,7 @@ class MqttService {
     }
 
     // Reset back to idle screen after 15 seconds
-    this.scheduleIdleReset(15000);
+    if (!replayed) this.scheduleIdleReset(15000);
   }
 
   sendDisplay(displayData) {

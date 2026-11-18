@@ -7,7 +7,8 @@
     "start": "node backend/server.js",
     "dev": "node backend/server.js",
     "test": "node test-suite.js",
-    "simulate": "node test-mqtt-sim.js"
+    "simulate": "node test-mqtt-sim.js",
+    "test:reliability": "node tests/reliability-test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
