@@ -17,6 +17,16 @@
  *     (RFID + buttons + OLED) while offline and syncs when back online.
  *   - Online/offline status is published (retained) with an MQTT Last Will.
  *   - Events carry a real timestamp from NTP when available.
+ *
+ * Reminders (hub -> station):
+ *   - Subscribes to petlink/<deviceId>/cmd. {"type":"reminder",...} flashes the
+ *     OLED and shows the text + how MANY players still have to do it (never
+ *     names: the screen is shared). Any button dismisses the pop-up; a short
+ *     line stays on the idle screen until everyone is done or it expires.
+ *   - Personal to-do list ("Still to do: Water, Reading") is shown only after
+ *     a player taps their own RFID card.
+ *   - Retained by the broker, so a reminder sent while offline arrives on
+ *     reconnect; `expires` drops stale ones, `id` ignores repeats.
  * =========================================================================
  */
 
@@ -33,6 +43,7 @@
 
 #include "config.h"
 #include "offline_queue.h"
+#include <Preferences.h>
 
 // OLED Display Configuration
 #define SCREEN_WIDTH 128
@@ -85,6 +96,23 @@ String statusTopic;                   // petlink/device/status/<MQTT_CLIENT_ID>
 char willPayload[160];                // Last Will message ("offline")
 bool timeSynced = false;
 
+// Reminder state
+String cmdTopic;                      // petlink/<MQTT_CLIENT_ID>/cmd  (reminders: .../cmd/reminder/<habit>)
+String lastReminderId = "";           // ignore repeats of the same retained reminder
+String pendingReminder = "";          // arrived while a player was busy -> show later
+bool reminderShowing = false;
+Preferences reminderPrefs;
+
+// Anonymous reminders kept on the idle screen ("Drink water! 2 left"), one per habit
+struct ActiveReminder {
+  String habit;
+  String text;
+  int remaining;
+  long long expires;
+};
+const int MAX_ACTIVE_REMINDERS = 4;
+ActiveReminder activeReminders[MAX_ACTIVE_REMINDERS];
+
 // Display lines buffer
 String dispLine1 = "PETLINK STATION";
 String dispLine2 = "Starting up...";
@@ -105,6 +133,11 @@ void maintainWiFi();
 void flushQueue();
 void handleAck(const char* json);
 void showIdle();
+void handleCommand(const char* json);
+void showReminder(JsonDocument& doc);
+void setActiveReminder(JsonDocument& doc);
+void clearActiveReminder(const String& habit);
+String reminderIdleLine();
 void showMessage(const String& l1, const String& l2, const String& l3, const String& l4, unsigned long ms);
 bool isOnline();
 
@@ -150,6 +183,13 @@ void setup() {
 
   // 7. Connect to WiFi & setup MQTT
   statusTopic = String(TOPIC_STATUS_PREFIX) + MQTT_CLIENT_ID;
+  cmdTopic = String("petlink/") + MQTT_CLIENT_ID + "/cmd";
+  reminderPrefs.begin("petlink_rem", false);
+  lastReminderId = reminderPrefs.getString("last", "");
+  if (BUZZ_PIN >= 0) {
+    pinMode(BUZZ_PIN, OUTPUT);
+    digitalWrite(BUZZ_PIN, LOW);
+  }
   snprintf(willPayload, sizeof(willPayload),
            "{\"deviceId\":\"%s\",\"online\":false,\"reason\":\"connection_lost\"}", MQTT_CLIENT_ID);
 
@@ -182,9 +222,17 @@ void loop() {
 
   // 1d. Temporary messages return to the idle screen
   if (currentState == STATE_SHOW_MESSAGE && millis() > messageUntil) {
+    reminderShowing = false;
     currentState = STATE_IDLE;
     activeUid = "";
     showIdle();
+  }
+
+  // 1e. A reminder that arrived while the station was busy
+  if (pendingReminder.length() > 0 && currentState == STATE_IDLE) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, pendingReminder)) showReminder(doc);
+    pendingReminder = "";
   }
 
   // 2. Read Light Sensor periodically
@@ -284,6 +332,8 @@ void reconnectMQTT() {
     Serial.println("[MQTT] Connected successfully!");
     mqttClient.subscribe(TOPIC_DISPLAY);
     mqttClient.subscribe(TOPIC_ACK);
+    String cmdFilter = cmdTopic + "/#";          // .../cmd and every .../cmd/reminder/<habit>
+    mqttClient.subscribe(cmdFilter.c_str(), 1);
     Serial.printf("[MQTT] Subscribed to: %s, %s\n", TOPIC_DISPLAY, TOPIC_ACK);
 
     // Retained "online" status (replaces the Last Will message on the broker)
@@ -367,6 +417,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // Commands from the hub (reminders on .../cmd/reminder/<habit>)
+  String t = String(topic);
+  if (t == cmdTopic || t.startsWith(cmdTopic + "/")) {
+    if (length == 0) {                // empty retained message = reminder cleared
+      String habit = t.substring(t.lastIndexOf('/') + 1);
+      clearActiveReminder(habit);
+      Serial.printf("[Reminder] %s cleared (everyone done).\n", habit.c_str());
+      if (currentState == STATE_IDLE) showIdle();
+      return;
+    }
+    handleCommand(jsonBuffer);
+    return;
+  }
+
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, jsonBuffer);
   if (error) {
@@ -381,12 +445,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   const char* status = doc["status"] | "";
 
   if (strcmp(status, "ready") == 0) {
+    // Personal to-do list: only shown now, after this player tapped THEIR card
+    const char* todo = doc["todo"] | "";
+    if (strlen(todo) > 0) {
+      String t = String(todo);
+      String a = t.substring(0, 21);
+      String b = t.length() > 21 ? t.substring(21, 42) : String("");
+      renderScreen(line1, "Still to do today:", a, b);
+      delay(2500);
+    }
     currentState = STATE_HABIT_SELECT;
     stateTimeout = millis() + 30000; // 30 sec timeout
     selectedHabitIndex = 0;
     renderHabitSelection();
-  } else if (strcmp(status, "idle") == 0 && currentState == STATE_HABIT_SELECT) {
-    // don't wipe out a player who is still choosing a habit
+  } else if (strcmp(status, "idle") == 0 && (currentState == STATE_HABIT_SELECT || reminderShowing)) {
+    // don't wipe out a player who is still choosing a habit, or a reminder
     return;
   } else {
     renderScreen(line1, line2, line3, line4);
@@ -418,6 +491,7 @@ void handleRfidCard() {
 
   Serial.printf("[RFID] Card Detected! UID: %s\n", uidStr.c_str());
   activeUid = uidStr;
+  reminderShowing = false;            // a card tap also dismisses a reminder
   currentState = STATE_HABIT_SELECT;
   selectedHabitIndex = 0;
   stateTimeout = millis() + 30000;
@@ -455,6 +529,22 @@ void handleRfidCard() {
 // =========================================================================
 void handleButtons() {
   unsigned long now = millis();
+
+  // Any button dismisses a reminder (and is not used for anything else)
+  if (reminderShowing &&
+      (digitalRead(BTN_NEXT_PIN) == LOW || digitalRead(BTN_SELECT_PIN) == LOW || digitalRead(BTN_CONFIRM_PIN) == LOW)) {
+    Serial.println("[Reminder] Dismissed by button.");
+    unsigned long t0 = millis();
+    while ((digitalRead(BTN_NEXT_PIN) == LOW || digitalRead(BTN_SELECT_PIN) == LOW ||
+            digitalRead(BTN_CONFIRM_PIN) == LOW) && millis() - t0 < 1000) {
+      delay(10);                      // wait for release so the press isn't reused
+    }
+    lastBtnNextPress = lastBtnSelectPress = lastBtnConfirmPress = millis();
+    reminderShowing = false;
+    currentState = STATE_IDLE;
+    showIdle();
+    return;
+  }
 
   // NEXT Button (GPIO 25) - Cycle to next habit
   if (digitalRead(BTN_NEXT_PIN) == LOW && (now - lastBtnNextPress > DEBOUNCE_DELAY)) {
@@ -574,12 +664,139 @@ void renderScreen(const String& l1, const String& l2, const String& l3, const St
   updateOled();
 }
 
-// Idle screen; line 4 shows the offline / sync state.
+// =========================================================================
+// Reminders / commands from the hub (petlink/<deviceId>/cmd)
+// =========================================================================
+void handleCommand(const char* json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) {
+    Serial.println("[CMD] Invalid JSON, ignored.");
+    return;
+  }
+  const char* type = doc["type"] | "";
+
+  // Someone logged the habit -> fewer players to go (no pop-up)
+  if (strcmp(type, "reminder_update") == 0) {
+    setActiveReminder(doc);
+    Serial.printf("[Reminder] Update: %s, %d player(s) still to go.\n",
+                  (const char*)(doc["habit_id"] | ""), (int)(doc["remaining"] | 0));
+    if (currentState == STATE_IDLE) showIdle();
+    return;
+  }
+  // Everyone did it -> remove the reminder line
+  if (strcmp(type, "reminder_clear") == 0) {
+    clearActiveReminder(String(doc["habit_id"] | ""));
+    Serial.println("[Reminder] Everyone done, reminder cleared.");
+    if (currentState == STATE_IDLE) showIdle();
+    return;
+  }
+  if (strcmp(type, "reminder") != 0) {
+    Serial.printf("[CMD] Unknown command type '%s', ignored.\n", type);
+    return;
+  }
+
+  const char* id = doc["id"] | "";
+  if (strlen(id) == 0 || lastReminderId == id) {
+    // retained copy after reconnect/reboot: no pop-up again, but keep the idle line
+    Serial.printf("[Reminder] %s already shown, no pop-up.\n", id);
+    setActiveReminder(doc);
+    if (currentState == STATE_IDLE) showIdle();
+    return;
+  }
+  long long expires = doc["expires"] | 0LL;
+  if (timeSynced && expires > 0 && (long long)time(nullptr) > expires) {
+    Serial.printf("[Reminder] %s expired, ignored.\n", id);
+    lastReminderId = id;
+    reminderPrefs.putString("last", lastReminderId);
+    return;
+  }
+
+  // Don't interrupt a player who is choosing / submitting a habit
+  if (currentState == STATE_HABIT_SELECT || currentState == STATE_CONFIRMING) {
+    Serial.printf("[Reminder] %s arrived while station busy -> will show when idle.\n", id);
+    pendingReminder = json;
+    return;
+  }
+  showReminder(doc);
+}
+
+void showReminder(JsonDocument& doc) {
+  const char* id = doc["id"] | "";
+  const char* text = doc["text"] | "Reminder";
+  int remaining = doc["remaining"] | 0;
+  bool buzz = doc["buzz"] | false;
+
+  lastReminderId = id;
+  reminderPrefs.putString("last", lastReminderId);   // survives reboot
+  setActiveReminder(doc);
+  Serial.printf("[Reminder] %s: %s (%d to go)\n", id, text, remaining);
+
+  // Get attention: flash the screen (and buzz, if a motor is fitted)
+  for (int i = 0; i < 3; i++) {
+    display.invertDisplay(true);
+    if (buzz && BUZZ_PIN >= 0) digitalWrite(BUZZ_PIN, HIGH);
+    delay(150);
+    display.invertDisplay(false);
+    if (BUZZ_PIN >= 0) digitalWrite(BUZZ_PIN, LOW);
+    delay(150);
+  }
+
+  // Count only - the station is shared, so no names here
+  String countLine = remaining > 0 ? String(remaining) + (remaining == 1 ? " player to go" : " players to go") : String("");
+  String textLine = String(text);
+  if (textLine.length() > 21) textLine = textLine.substring(0, 21);
+
+  showMessage("** REMINDER **", textLine, countLine, "Any button = OK", REMINDER_SHOW_MS);
+  reminderShowing = true;
+}
+
+// Add or update the reminder for this habit (one slot per habit).
+void setActiveReminder(JsonDocument& doc) {
+  String habit = String(doc["habit_id"] | "");
+  if (habit.length() == 0) return;
+  int slot = -1;
+  for (int i = 0; i < MAX_ACTIVE_REMINDERS; i++) {
+    if (activeReminders[i].habit == habit) { slot = i; break; }
+    if (slot < 0 && activeReminders[i].habit.length() == 0) slot = i;
+  }
+  if (slot < 0) slot = 0;   // all full: replace the oldest slot
+  activeReminders[slot].habit = habit;
+  activeReminders[slot].text = String(doc["text"] | "Reminder");
+  activeReminders[slot].remaining = doc["remaining"] | 0;
+  activeReminders[slot].expires = doc["expires"] | 0LL;
+}
+
+void clearActiveReminder(const String& habit) {
+  for (int i = 0; i < MAX_ACTIVE_REMINDERS; i++) {
+    if (activeReminders[i].habit == habit) activeReminders[i].habit = "";
+  }
+}
+
+// "Drink water! 2 left" for the first active, unexpired reminder, else "".
+String reminderIdleLine() {
+  for (int i = 0; i < MAX_ACTIVE_REMINDERS; i++) {
+    ActiveReminder& r = activeReminders[i];
+    if (r.habit.length() == 0) continue;
+    if (timeSynced && r.expires > 0 && (long long)time(nullptr) > r.expires) {
+      r.habit = "";            // expired
+      continue;
+    }
+    String suffix = r.remaining > 0 ? " " + String(r.remaining) + " left" : "";
+    int room = 21 - suffix.length();
+    String t = r.text.length() > (unsigned)room ? r.text.substring(0, room) : r.text;
+    return t + suffix;
+  }
+  return "";
+}
+
+// Idle screen; line 4 shows the offline / sync state, or an active reminder.
 void showIdle() {
   int n = OfflineQueue::pending();
   String status;
+  String rem = reminderIdleLine();
   if (!isOnline()) status = n > 0 ? "OFFLINE: " + String(n) + " saved" : "OFFLINE mode";
   else if (n > 0)  status = "Syncing " + String(n) + "...";
+  else if (rem.length() > 0) status = rem;
   else             status = ">> Tap Here <<";
   renderScreen("PETLINK STATION", "Ready", "Scan RFID Card", status);
 }

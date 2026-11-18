@@ -37,6 +37,12 @@ const char* TOPIC_ACK     = "petlink/device/ack";
 #define WIFI_RETRY_MS     10000  // try to re-join Wi-Fi every 10 s (non-blocking)
 #define MQTT_RETRY_MS     5000   // try to reconnect to the broker every 5 s
 
+// Reminders from the hub arrive on  petlink/<MQTT_CLIENT_ID>/cmd
+#define REMINDER_SHOW_MS  15000  // how long a reminder stays on the OLED
+// Optional vibration motor / buzzer (driven through a transistor, never directly).
+// -1 = not fitted (the OLED just flashes). Set e.g. 33 once the motor is wired.
+#define BUZZ_PIN          -1
+
 // 4. Pin Definitions (Matches user hardware exactly)
 // I2C (SSD1306 OLED & BH1750 Light Sensor)
 #define I2C_SDA_PIN    21

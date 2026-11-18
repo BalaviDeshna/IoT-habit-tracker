@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const db = require('../database/db');
 const petLogic = require('./petLogic');
 const MqttService = require('./mqttService');
+const { ReminderService } = require('./reminderService');
 const apiRoutes = require('./routes/api');
 
 const app = express();
@@ -35,7 +36,11 @@ const mqttService = new MqttService(io, {
 });
 
 // Mount API routes
-app.use('/api', apiRoutes(mqttService, io));
+// Reminders pushed from the hub to the station (petlink/{device_id}/cmd)
+const reminderService = new ReminderService(mqttService, io);
+mqttService.onHabitLogged = (habitId) => reminderService.onHabitLogged(habitId);
+
+app.use('/api', apiRoutes(mqttService, io, reminderService));
 
 // Fallback route to frontend index.html
 app.use((req, res, next) => {
@@ -76,6 +81,7 @@ io.on('connection', (socket) => {
 
 // Start MQTT and HTTP server
 mqttService.connect();
+reminderService.start();
 
 server.listen(PORT, () => {
   console.log('========================================================');

@@ -4,7 +4,44 @@ const db = require('../../database/db');
 const petLogic = require('../petLogic');
 const reliability = require('../deviceReliability');
 
-module.exports = function(mqttService, io) {
+module.exports = function(mqttService, io, reminderService) {
+  // ---- Reminders (hub -> station). Times can be changed here, no re-flashing ----
+  const reminderId = (req) => Number.parseInt(req.params.id, 10);
+  const send = (res, r, okStatus = 200) => r.error
+    ? res.status(r.status || 400).json({ success: false, error: r.error })
+    : res.status(okStatus).json({ success: true, data: r.value });
+
+  router.get('/reminders', (req, res) => {
+    res.json({ success: true, data: reminderService ? reminderService.list() : [] });
+  });
+
+  router.post('/reminders', (req, res) => {
+    if (!reminderService) return res.status(503).json({ success: false, error: 'Reminder service not running' });
+    send(res, reminderService.create(req.body || {}), 201);
+  });
+
+  router.patch('/reminders/:id', (req, res) => {
+    if (!reminderService) return res.status(503).json({ success: false, error: 'Reminder service not running' });
+    send(res, reminderService.update(reminderId(req), req.body || {}));
+  });
+
+  router.delete('/reminders/:id', (req, res) => {
+    if (!reminderService) return res.status(503).json({ success: false, error: 'Reminder service not running' });
+    const ok = reminderService.remove(reminderId(req));
+    res.status(ok ? 200 : 404).json({ success: ok, ...(ok ? {} : { error: 'not found' }) });
+  });
+
+  // Send one reminder right now (for the demo / testing). ?force=true ignores "everyone done".
+  router.post('/reminders/:id/send', (req, res) => {
+    if (!reminderService) return res.status(503).json({ success: false, error: 'Reminder service not running' });
+    const row = reminderService.get(reminderId(req));
+    if (!row) return res.status(404).json({ success: false, error: 'not found' });
+    const raw = { id: row.id, habit_id: row.habitId, time_hhmm: row.time, text: row.text,
+      only_if_not_done: row.onlyIfNotDone ? 1 : 0, buzz: row.buzz ? 1 : 0 };
+    const result = reminderService.send(raw, { reason: 'manual', force: req.query.force === 'true' });
+    res.json({ success: true, data: result });
+  });
+
   // Station online/offline + store-and-forward counters
   router.get('/devices', (req, res) => {
     try {

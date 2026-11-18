@@ -164,6 +164,15 @@ class MqttService {
 
     const result = petLogic.processRfidScan(uid);
 
+    // PRIVACY: personal to-do list, only after the player identified themselves
+    // with their own card. Shown briefly on the station before the habit menu.
+    if (result.success && result.display) {
+      const todo = db.getHabits()
+        .filter((h) => !(result.completedToday || []).includes(h.id))
+        .map((h) => h.name);
+      result.display.todo = todo.length ? todo.join(', ') : 'All done today!';
+    }
+
     // Send display instructions to ESP32 OLED
     this.sendDisplay(result.display);
 
@@ -263,6 +272,11 @@ class MqttService {
       this.sendAck(deviceId, eventId, outcome);
     }
 
+    // Let reminders update their anonymous "N still to go" count
+    if (result.success && typeof this.onHabitLogged === 'function') {
+      try { this.onHabitLogged(result.habit.id); } catch (e) { console.error('[REMINDER] update failed:', e.message); }
+    }
+
     // Send feedback to ESP32 OLED (not for queued events: nobody is waiting at the
     // station for those, the ESP32 shows its own "SYNC COMPLETE" message instead)
     if (!replayed) {
@@ -322,6 +336,7 @@ class MqttService {
       line2: (displayData.line2 || '').slice(0, 20),
       line3: (displayData.line3 || '').slice(0, 20),
       line4: (displayData.line4 || '').slice(0, 20),
+      ...(typeof displayData.todo === 'string' ? { todo: displayData.todo.slice(0, 60) } : {}),
       timestamp: Date.now()
     });
 
@@ -334,8 +349,10 @@ class MqttService {
     });
 
     // Also mirror to web clients so frontend has a live virtual OLED preview!
+    // (without the personal to-do list: the website is shared too)
     if (this.io) {
-      this.io.emit('device_display', displayData);
+      const { todo, ...shared } = displayData;
+      this.io.emit('device_display', shared);
     }
   }
 
