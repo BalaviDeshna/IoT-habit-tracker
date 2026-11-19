@@ -14,6 +14,8 @@ const char* WIFI_PASSWORD = "YOUR_HOTSPOT_PASSWORD";
 // Run `ipconfig` in Windows Command Prompt to find your laptop IPv4 address (e.g., 192.168.43.100)
 const char* MQTT_BROKER   = "192.168.1.100";
 const int   MQTT_PORT     = 1883;
+const char* MQTT_USERNAME = ""; // set if Mosquitto authentication is enabled
+const char* MQTT_PASSWORD = "";
 const char* MQTT_CLIENT_ID = "esp32_petlink_station";
 
 // 3. MQTT Topics

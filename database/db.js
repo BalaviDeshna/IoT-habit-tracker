@@ -54,6 +54,13 @@ function initDb() {
       UNIQUE (player_id, habit_id, log_date)
     );
 
+    CREATE TABLE IF NOT EXISTS device_assignments (
+      device_id TEXT PRIMARY KEY,
+      player_id INTEGER NOT NULL,
+      assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS habitat_state (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       lux REAL DEFAULT 150.0,
@@ -81,6 +88,14 @@ function initDb() {
     }
     console.log('[DB] Seeded default habits: water, exercise, reading.');
   }
+
+  // Ensure the revised PetLink habits exist even in databases created by the older version.
+  const addHabit = db.prepare(`INSERT OR IGNORE INTO habits (id, name, icon, xp_reward, happiness_reward, description) VALUES (?, ?, ?, ?, ?, ?)`);
+  [
+    ['meals', 'Eat a Meal', '🍽️', 15, 8, 'Log a meal'],
+    ['mood', 'Mood Check-in', '🙂', 10, 8, 'Record a mood check-in'],
+    ['outdoor_walk', 'Outdoor Walk', '🚶', 30, 20, 'Sensor-verified outdoor walking']
+  ].forEach(h => addHabit.run(...h));
 
   // Seed 4 predefined players and pets
   const playerCount = db.prepare('SELECT COUNT(*) as count FROM players').get().count;
@@ -235,6 +250,19 @@ function updatePlayerUid(playerId, newUid) {
   return db.prepare(`UPDATE players SET rfid_uid = ? WHERE id = ?`).run(normalized, playerId);
 }
 
+function assignDeviceToPlayer(deviceId, playerId) {
+  if (!deviceId || !Number.isInteger(Number(playerId))) throw new Error('deviceId and playerId are required');
+  const player = getPlayerById(Number(playerId));
+  if (!player) throw new Error('Player not found');
+  db.prepare(`INSERT INTO device_assignments (device_id, player_id) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET player_id=excluded.player_id, assigned_at=CURRENT_TIMESTAMP`).run(String(deviceId), Number(playerId));
+  return getPlayerByDeviceId(deviceId);
+}
+
+function getPlayerByDeviceId(deviceId) {
+  if (!deviceId) return null;
+  return db.prepare(`SELECT p.id, p.rfid_uid, p.name, p.avatar, pt.id AS pet_id, pt.name AS pet_name, pt.species AS pet_species, pt.emoji AS pet_emoji, pt.xp, pt.happiness, pt.level FROM device_assignments a JOIN players p ON p.id=a.player_id JOIN pets pt ON pt.player_id=p.id WHERE a.device_id=?`).get(String(deviceId)) || null;
+}
+
 function getHabits() {
   return db.prepare('SELECT * FROM habits ORDER BY id ASC').all();
 }
@@ -361,6 +389,8 @@ module.exports = {
   getAllPlayersWithPets,
   getPlayerByUid,
   getPlayerById,
+  assignDeviceToPlayer,
+  getPlayerByDeviceId,
   updatePlayerUid,
   getHabits,
   getHabitById,

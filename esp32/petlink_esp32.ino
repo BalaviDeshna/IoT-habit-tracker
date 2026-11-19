@@ -328,7 +328,10 @@ void reconnectMQTT() {
   Serial.printf("[MQTT] Connecting to broker %s:%d...\n", MQTT_BROKER, MQTT_PORT);
   // Last Will: if this station disappears (power cut, Wi-Fi gone) the BROKER
   // publishes willPayload for us, retained, so everyone learns we're offline.
-  if (mqttClient.connect(MQTT_CLIENT_ID, statusTopic.c_str(), 1, true, willPayload)) {
+  bool mqttOk = (strlen(MQTT_USERNAME) > 0)
+    ? mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD, statusTopic.c_str(), 1, true, willPayload)
+    : mqttClient.connect(MQTT_CLIENT_ID, statusTopic.c_str(), 1, true, willPayload);
+  if (mqttOk) {
     Serial.println("[MQTT] Connected successfully!");
     mqttClient.subscribe(TOPIC_DISPLAY);
     mqttClient.subscribe(TOPIC_ACK);

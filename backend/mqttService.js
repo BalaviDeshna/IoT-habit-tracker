@@ -18,6 +18,7 @@ class MqttService {
       HABIT: 'petlink/device/habit',
       DISPLAY: 'petlink/device/display',
       STATUS: reliability.STATUS_TOPIC_FILTER,   // petlink/device/status/+
+      WEARABLE_EVENTS: 'petlink/+/event',
       ACK: reliability.ACK_TOPIC                 // petlink/device/ack
     };
   }
@@ -29,7 +30,8 @@ class MqttService {
       clientId: this.clientId,
       clean: true,
       reconnectPeriod: 3000, // Reconnect every 3 seconds if disconnected
-      connectTimeout: 10000
+      connectTimeout: 10000,
+      ...(process.env.MQTT_USERNAME ? { username: process.env.MQTT_USERNAME, password: process.env.MQTT_PASSWORD || '' } : {})
     });
 
     this.client.on('connect', () => {
@@ -37,7 +39,7 @@ class MqttService {
       console.log(`[MQTT] Successfully connected to broker: ${this.brokerUrl}`);
 
       // Subscribe to all incoming device topics
-      const subscribeTopics = [this.TOPICS.LIGHT, this.TOPICS.RFID, this.TOPICS.HABIT, this.TOPICS.STATUS];
+      const subscribeTopics = [this.TOPICS.LIGHT, this.TOPICS.RFID, this.TOPICS.HABIT, this.TOPICS.STATUS, this.TOPICS.WEARABLE_EVENTS];
       this.client.subscribe(subscribeTopics, { qos: 1 }, (err, granted) => {
         if (err) {
           console.error('[MQTT] Subscription error:', err.message);
@@ -108,7 +110,11 @@ class MqttService {
       return;
     }
 
-    const timestamp = payload.timestamp || Date.now();
+    const timestamp = payload.timestamp || payload.ts || Date.now();
+
+    // Revised wearable contract: petlink/{device_id}/event
+    const wearableMatch = topic.match(/^petlink\/([^/]+)\/event$/);
+    if (wearableMatch) { this.handleWearableEvent(wearableMatch[1], payload); return; }
     const deviceId = payload.deviceId || 'unknown-device';
 
     // 2. Dispatch according to topic
@@ -163,6 +169,13 @@ class MqttService {
     console.log(`[MQTT] [RFID] Scanned card UID: "${uid}" from device: ${deviceId}`);
 
     const result = petLogic.processRfidScan(uid);
+
+    // The hub RFID scan assigns the shared/demo wearable to this family member.
+    // For multiple simultaneous wearers, give each wearable its own device_id and scan at its hub.
+    if (result.success) {
+      try { db.assignDeviceToPlayer(process.env.DEFAULT_WEARABLE_ID || 'band_01', result.player.id); }
+      catch (e) { console.error('[MQTT] Could not assign wearable:', e.message); }
+    }
 
     // PRIVACY: personal to-do list, only after the player identified themselves
     // with their own card. Shown briefly on the station before the habit menu.
@@ -322,6 +335,56 @@ class MqttService {
 
     // Reset back to idle screen after 15 seconds
     if (!replayed) this.scheduleIdleReset(15000);
+  }
+
+  handleWearableEvent(deviceId, payload) {
+    const eventId = payload.event_id || payload.eventId;
+    if (!eventId || !reliability.isValidEventId(eventId)) {
+      console.warn('[WEARABLE] Missing/invalid event_id'); return;
+    }
+    const previous = reliability.findEvent(eventId);
+    if (previous) { this.sendAck(deviceId, eventId, 'duplicate'); return; }
+
+    const player = db.getPlayerByDeviceId(deviceId);
+    if (!player) {
+      // Do not ACK: keep the event in the wearable's flash queue until an RFID scan assigns a player.
+      if (this.io) this.io.emit('wearable_error', { deviceId, error: 'No player assigned. Scan that player\'s RFID card at the hub first.' });
+      return;
+    }
+
+    const habitId = String(payload.habit_id || '');
+    const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+    const { logDate } = reliability.resolveLogDate(payload.ts);
+    let result;
+    try {
+      if (habitId === 'outdoor_walk') {
+        const steps = Number(data.steps || 0);
+        const lux = Number(data.avg_lux || 0);
+        const uv = Number(data.max_uv || 0);
+        const daytime = payload.daytime !== false;
+        const verified = payload.verified === true && steps >= 600 && daytime && (uv > 0.2 || lux >= 5000);
+        if (!verified) {
+          result = { success: false, error: 'Outdoor Walk verification thresholds not met' };
+        } else {
+          result = db.recordHabitCompletion(player.id, 'outdoor_walk', logDate);
+        }
+      } else if (['water', 'meals', 'mood'].includes(habitId)) {
+        result = db.recordHabitCompletion(player.id, habitId, logDate);
+      } else {
+        result = { success: false, error: `Unsupported wearable habit: ${habitId}` };
+      }
+    } catch (err) { result = { success: false, error: err.message }; }
+
+    const outcome = result.success ? 'logged' : result.duplicate ? 'already_done' : 'rejected';
+    reliability.recordEvent({ eventId, deviceId, kind: habitId || 'wearable', ts: Number(payload.ts) || null, tsSource: payload.ts_source, replayed: !!payload.replayed, result: outcome });
+    this.sendAck(deviceId, eventId, outcome);
+
+    if (result.success) {
+      const updated = db.getPlayerById(player.id);
+      if (this.io) this.io.emit('habit_completed', { success: true, player: updated, habit: result.habit, awarded: result.awarded, allPlayers: db.getAllPlayersWithPets(), recentLogs: db.getRecentLogs(10), deviceId, eventId, replayed: !!payload.replayed, logDate });
+    } else if (this.io) {
+      this.io.emit('wearable_event_result', { deviceId, playerId: player.id, habitId, success: false, duplicate: !!result.duplicate, error: result.error || result.message || 'Already completed' });
+    }
   }
 
   sendDisplay(displayData) {
