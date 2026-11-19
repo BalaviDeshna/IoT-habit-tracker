@@ -15,6 +15,10 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <time.h>
+#include <Wire.h>
+
+
+
 
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
@@ -23,8 +27,8 @@
 #define MQTT_USERNAME ""
 #define MQTT_PASSWORD ""
 #define DEVICE_ID "band_01"
-#define SDA_PIN 21
-#define SCL_PIN 22
+#define I2C_SDA 8
+#define I2C_SCL 9
 #define NEXT_PIN 25
 #define SELECT_PIN 26
 #define OLED_ADDR 0x3C
@@ -37,6 +41,8 @@
 #define SYNC_MS 10000UL
 #define ACK_TIMEOUT_MS 5000UL
 #define STEP_THRESHOLD 1.15f
+#define BUTTON_1_PIN 4
+#define BUTTON_2_PIN 5
 
 Adafruit_MPU6050 mpu;
 BH1750 lightMeter;
@@ -62,7 +68,21 @@ void connectMqtt(){ if(mqtt.connected()||WiFi.status()!=WL_CONNECTED)return; Str
 void render(){ oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0,0); oled.println("PETLINK BAND"); oled.print("Steps: "); oled.println(steps); oled.print("Lux: "); oled.println(luxCount?luxSum/luxCount:0,0); oled.println("NEXT: habit menu"); oled.println(menuItems[menu]); oled.println("SELECT: log habit"); oled.display(); }
 void makeEvent(const char* habit,bool verified,int eventSteps,float avgLux,float uv){ String id=newEventId(); JsonDocument d; d["device_id"]=DEVICE_ID; d["event_id"]=id; d["habit_id"]=habit; d["ts"]=(uint32_t)time(nullptr); d["ts_source"]=timeReady?"ntp":"local"; d["verified"]=verified; time_t nowLocal=time(nullptr); struct tm tmLocal; localtime_r(&nowLocal,&tmLocal); bool daytime=timeReady && tmLocal.tm_hour>=6 && tmLocal.tm_hour<20; d["daytime"]=daytime; JsonObject data=d["data"].to<JsonObject>(); data["steps"]=eventSteps; data["avg_lux"]=avgLux; data["max_uv"]=uv; data["window_s"]=600; String json; serializeJson(d,json); if(!queueEvent(json)) Serial.println("Queue full/write failed"); }
 void syncQueue(){ if(!mqtt.connected())return; if(inflight.length() && millis()-sentAt<ACK_TIMEOUT_MS)return; if(inflight.length())inflight=""; String id,json; if(!oldestEvent(id,json))return; if(mqtt.publish(topicEvent.c_str(),json.c_str(),false)){ inflight=id; sentAt=millis(); } }
-void setup(){ Serial.begin(115200); pinMode(NEXT_PIN,INPUT_PULLUP); pinMode(SELECT_PIN,INPUT_PULLUP); Wire.begin(SDA_PIN,SCL_PIN); oled.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR); oled.clearDisplay(); oled.display(); sensorsOK=mpu.begin() && lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE); if(!sensorsOK)Serial.println("Sensor init issue; check I2C wiring"); mpu.setAccelerometerRange(MPU6050_RANGE_4_G); mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); LittleFS.begin(true); LittleFS.mkdir("/q"); prefs.begin("petlink_band",false); seq=prefs.getUInt("seq",0); mqtt.setServer(MQTT_HOST,MQTT_PORT); mqtt.setCallback(ackCallback); mqtt.setBufferSize(512); windowStart=millis(); connectWifi(); connectMqtt(); render(); }
+void setup() {
+    Serial.begin(115200);
+
+    // Initialise I2C
+    Wire.begin(I2C_SDA, I2C_SCL);
+
+    // Initialise sensors
+    mpu.begin();
+    lightSensor.begin();
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+    // Initialise buttons
+    pinMode(BUTTON_1_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+}
 void loop(){ if(WiFi.status()!=WL_CONNECTED)connectWifi(); if(!mqtt.connected())connectMqtt(); mqtt.loop(); unsigned long now=millis();
  if(now-lastImu>=IMU_SAMPLE_MS){ lastImu=now; sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t); float mag=sqrt(a.acceleration.x*a.acceleration.x+a.acceleration.y*a.acceleration.y+a.acceleration.z*a.acceleration.z)/9.80665f; if(mag>STEP_THRESHOLD && !abovePeak){ if(now-lastPeak>300){ steps++; windowSteps++; lastPeak=now; } abovePeak=true; } if(mag<1.05f) abovePeak=false; }
  if(now-lastLight>=LIGHT_SAMPLE_MS){ lastLight=now; float lux=lightMeter.readLightLevel(); if(lux>=0){luxSum+=lux;luxCount++;} }
