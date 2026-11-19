@@ -23,10 +23,10 @@
 #define MQTT_USERNAME ""
 #define MQTT_PASSWORD ""
 #define DEVICE_ID "band_01"
-#define SDA_PIN 21
-#define SCL_PIN 22
-#define NEXT_PIN 25
-#define SELECT_PIN 26
+#define SDA_PIN 8        // Shared I2C data (MPU6050, BH1750, OLED) - ESP32-S3
+#define SCL_PIN 9        // Shared I2C clock (MPU6050, BH1750, OLED) - ESP32-S3
+#define NEXT_PIN 4       // Button 1 (to GND) - ESP32-S3
+#define SELECT_PIN 5     // Button 2 (to GND) - ESP32-S3
 #define OLED_ADDR 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -72,3 +72,4 @@ void loop(){ if(WiFi.status()!=WL_CONNECTED)connectWifi(); if(!mqtt.connected())
  if(digitalRead(SELECT_PIN)==LOW && now-lastSelect>250){ const char* h=(menu==0?"water":menu==1?"meals":"mood"); makeEvent(h,false,steps,luxCount?luxSum/luxCount:0,0); lastSelect=now; render(); }
  if(now-lastSync>SYNC_MS){syncQueue();lastSync=now;}
 }
+

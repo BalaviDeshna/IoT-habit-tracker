@@ -7,12 +7,12 @@
 // =========================================================================
 
 // 1. Wi-Fi Settings (Connect ESP32 to phone hotspot)
-const char* WIFI_SSID     = "YOUR_HOTSPOT_SSID";
-const char* WIFI_PASSWORD = "YOUR_HOTSPOT_PASSWORD";
+const char* WIFI_SSID     = "meow";
+const char* WIFI_PASSWORD = "meow";
 
 // 2. MQTT Broker Settings (Your Windows Laptop running Mosquitto)
 // Run `ipconfig` in Windows Command Prompt to find your laptop IPv4 address (e.g., 192.168.43.100)
-const char* MQTT_BROKER   = "192.168.1.100";
+const char* MQTT_BROKER   = "meow";
 const int   MQTT_PORT     = 1883;
 const char* MQTT_USERNAME = ""; // set if Mosquitto authentication is enabled
 const char* MQTT_PASSWORD = "";
