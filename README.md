@@ -150,3 +150,7 @@ See [`esp32/README_ESP32.md`](file:///esp32/README_ESP32.md) for full wiring sch
 3. Set `MQTT_BROKER = "YOUR_LAPTOP_IP"` in `esp32/config.h`.
 4. Flash `esp32/petlink_esp32.ino` using the Arduino IDE.
 5. Tap your cards and track your habits in real-time!
+
+
+## Revised two-board setup (hub + wearable)
+See `docs/HARDWARE_WIRING.md` and `docs/MQTT_CONTRACT.md`. Keep `esp32/petlink_esp32.ino` as the RFID hub firmware. Flash `esp32/wearable/petlink_wearable.ino` to the second ESP32 wearable. The hub's RFID scan assigns `band_01` to the scanned player; with one wearable this is a single active wearer at a time. Set `DEFAULT_WEARABLE_ID=band_01` in `.env` (or leave the backend default). The wearable currently implements MPU6050 step estimate, BH1750 light sampling, OLED and two buttons; UV, motor, battery management and reminders are intentionally deferred.
