@@ -110,13 +110,13 @@ function initDb() {
 
     const defaultPlayers = [
       {
-        uid: 'A1B2C3D4',
+        uid: 'FC171005',
         name: 'Alex',
         avatar: '🦊',
         pet: { name: 'Sparky', species: 'Fox Sprite', emoji: '🦊', xp: 45, happiness: 85, level: 1 }
       },
       {
-        uid: 'E5F6A7B8',
+        uid: 'AA99ED00',
         name: 'Bella',
         avatar: '🐱',
         pet: { name: 'Mochi', species: 'Star Cat', emoji: '🐱', xp: 60, happiness: 90, level: 1 }
